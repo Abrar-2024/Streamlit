@@ -208,7 +208,7 @@ if page == "التصنيف":
 elif page == "لوحة المتابعة":
     st.title("📈 لوحة متابعة المصنفين")
 
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
     if "admin_authenticated" not in st.session_state:
         password = st.text_input("🔐 أدخل كلمة المرور:", type="password")
         if password:
