@@ -5,6 +5,7 @@ import psycopg2
 import random
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
+import emoji
 
 load_dotenv()
 
@@ -56,14 +57,14 @@ def fetch_random_tweet(user_id):
             cur.execute("""
                 WITH remaining AS (
                     SELECT id
-                    FROM twitter_hate_api_365
+                    FROM final_clean_tweets2
                     WHERE id NOT IN (
                         SELECT tweet_id FROM tweet_annotations WHERE user_id = %s
                     )
                     LIMIT 1000
                 )
                 SELECT t.*
-                FROM twitter_hate_api_365 t
+                FROM final_clean_tweets2 t
                 JOIN remaining r ON t.id = r.id
                 OFFSET floor(random() * 1000)::int
                 LIMIT 1;
@@ -125,7 +126,9 @@ if page == "التصنيف":
 
     if tweet:
         st.markdown("### 📝 التغريدة:")
-        st.write(tweet["text"])
+        text =tweet["clean_text"]
+        converted = emoji.emojize(text, language='alias')
+        st.write(converted)
         st.markdown(f"🔍 **كلمة البحث:** `{tweet.get('search_term', '')}`")
 
         is_hate_options = {"نعم": "Yes", "لا": "No"}
