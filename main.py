@@ -1,3 +1,5 @@
+from __future__ import annotations   # يمكنك حذفه إن شئت
+
 from dotenv import load_dotenv
 import os
 import streamlit as st
@@ -92,7 +94,7 @@ def fetch_random_tweet(user_id: int,
             cur.execute("""
                 SELECT  t.*
                 FROM    final_clean_tweets2 t
-                WHERE   t.id >= %s
+                WHERE   t.id >= (%s)::double precision
                   AND   t.is_deleted = FALSE
                   AND   NOT EXISTS (
                           SELECT 1
