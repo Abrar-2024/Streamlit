@@ -7,6 +7,9 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime
 import emoji
 
+# ✨ أنواع متوافقة مع 3.7 / 3.8
+from typing import List, Dict, Any, Optional
+
 load_dotenv()
 
 st.set_page_config(page_title="تصنيف التغريدات", layout="centered")
@@ -23,6 +26,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# ------------------------------------------------------------------
+# 🛠️  إعداد الاتصال بقاعدة البيانات
+# ------------------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(
         dbname=os.getenv('DB_NAME'),
@@ -32,7 +38,10 @@ def get_db_connection():
         port=os.getenv('DB_PORT'),
     )
 
-def create_annotation_table():
+# ------------------------------------------------------------------
+# 🛡️  إنشاء جدول التصنيفات إن لم يكن موجودًا
+# ------------------------------------------------------------------
+def create_annotation_table() -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -51,29 +60,62 @@ def create_annotation_table():
             """)
         conn.commit()
 
-def fetch_random_tweet(user_id):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                WITH remaining AS (
-                    SELECT id
-                    FROM final_clean_tweets2
-                    WHERE id NOT IN (
-                        SELECT tweet_id FROM tweet_annotations WHERE user_id = %s
-                    )
-                    LIMIT 1000
-                )
-                SELECT t.*
-                FROM final_clean_tweets2 t
-                JOIN remaining r ON t.id = r.id
-                OFFSET floor(random() * 1000)::int
-                LIMIT 1;
-            """, (user_id,))
-            tweet = cur.fetchone()
-    return tweet
+# ------------------------------------------------------------------
+# ⚡️ جلب تغريدة عشوائية بأقل ضغط على القاعدة
+# ------------------------------------------------------------------
+def fetch_random_tweet(user_id: int,
+                       attempts: int = 8) -> Optional[Dict[str, Any]]:
+    """
+    تجلب تغريدة غير مصنَّفة للمستخدم بدون OFFSET/ORDER BY random().
+    الإصلاح يشمل:
+      • تحويل id إلى نص داخل شرط NOT EXISTS لتطابق الأنواع.
+      • تحويل min_id/max_id إلى int قبل استخدامها.
+    """
+    with get_db_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # حدود المدى
+        cur.execute("""
+            SELECT MIN(id) AS min_id, MAX(id) AS max_id
+            FROM final_clean_tweets2
+            WHERE is_deleted = FALSE;
+        """)
+        row = cur.fetchone()
+        if not row or row["min_id"] is None:
+            return None
 
-# حفظ التصنيف
-def save_annotation(tweet_id, internal_id, user_id, is_hate, main_cat, sub_cat, sentiment):
+        # نحولهما إلى int للتوافق مع random.randint
+        min_id = int(row["min_id"])
+        max_id = int(row["max_id"])
+
+        for _ in range(attempts):
+            rand_id = random.randint(min_id, max_id)
+
+            cur.execute("""
+                SELECT  t.*
+                FROM    final_clean_tweets2 t
+                WHERE   t.id >= %s
+                  AND   t.is_deleted = FALSE
+                  AND   NOT EXISTS (
+                          SELECT 1
+                          FROM   tweet_annotations a
+                          WHERE  a.tweet_id = t.id::text   -- 👈 تحويل id إلى نص
+                            AND  a.user_id  = %s
+                        )
+                ORDER BY t.id
+                LIMIT 1;
+            """, (rand_id, user_id))
+
+            tweet = cur.fetchone()
+            if tweet:
+                return tweet
+
+        return None
+
+# ------------------------------------------------------------------
+# 💾 حفظ التصنيف في جدول tweet_annotations
+# ------------------------------------------------------------------
+def save_annotation(tweet_id: str, internal_id: int, user_id: int,
+                    is_hate: bool, main_cat: str,
+                    sub_cat: Optional[str], sentiment: Optional[str]) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -81,15 +123,41 @@ def save_annotation(tweet_id, internal_id, user_id, is_hate, main_cat, sub_cat, 
                     tweet_id, tweet_internal_id, user_id,
                     is_hate_speech, main_category, sub_category, sentiment
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (tweet_id, internal_id, user_id, is_hate, main_cat, sub_cat, sentiment))
+            """, (tweet_id, internal_id, user_id,
+                  is_hate, main_cat, sub_cat, sentiment))
+        conn.commit()
+def delete_tweet(tweet_id: int, user_id: int) -> None:
+    """
+    يحدِّث is_deleted = TRUE في الجدول الأصلي
+    ويسجِّل العملية في tweet_annotations كـ status='deleted'.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # ➊ حذف منطقي في جدول التغريدات
+            cur.execute(
+                "UPDATE final_clean_tweets2 SET is_deleted = TRUE WHERE id = %s;",
+                (tweet_id,)
+            )
+            # ➋ توثيق الحذف في جدول التصنيفات
+            cur.execute("""
+                INSERT INTO tweet_annotations (
+                    tweet_id, tweet_internal_id, user_id,
+                    is_hate_speech, main_category, sub_category, sentiment, status
+                ) VALUES (%s, %s, %s, false, 'deleted', 'deleted', NULL, 'deleted');
+            """, (tweet_id, tweet_id, user_id))
         conn.commit()
 
+# ------------------------------------------------------------------
+# 📋 واجهة Streamlit
+# ------------------------------------------------------------------
 page = st.sidebar.selectbox("📁 اختر الصفحة", ["التصنيف", "لوحة المتابعة"])
 
+# =============== صفحة التصنيف ===============
 if page == "التصنيف":
     st.title("📊 تصنيف التغريدات")
     create_annotation_table()
 
+    # تسجيل الدخول للمصنِّف
     if "user_id" not in st.session_state:
         with st.form("auth_form"):
             user_id_input = st.number_input("🧑 رقم المصنف:", min_value=1, step=1)
@@ -97,28 +165,30 @@ if page == "التصنيف":
             submitted = st.form_submit_button("تسجيل الدخول")
 
         if submitted:
-            with get_db_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT password FROM annotators WHERE user_id = %s", (user_id_input,))
-                    row = cur.fetchone()
-                    if row and row[0] == user_password:
-                        st.session_state.user_id = user_id_input
-                        st.success("✅ تم تسجيل الدخول بنجاح")
-                        st.rerun()
-                    else:
-                        st.error("🚫 رقم المصنف أو كلمة المرور غير صحيحة.")
+            with get_db_connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT password FROM annotators WHERE user_id = %s",
+                            (user_id_input,))
+                row = cur.fetchone()
+                if row and row[0] == user_password:
+                    st.session_state.user_id = user_id_input
+                    st.success("✅ تم تسجيل الدخول بنجاح")
+                    st.rerun()
+                else:
+                    st.error("🚫 رقم المصنف أو كلمة المرور غير صحيحة.")
         st.stop()
 
     user_id = st.session_state.user_id
 
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM tweet_annotations WHERE user_id = %s;", (user_id,))
-            classified_count = cur.fetchone()[0]
+    # عدّاد التصنيفات
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM tweet_annotations WHERE user_id = %s;",
+                    (user_id,))
+        classified_count = cur.fetchone()[0]
 
     st.markdown(f"🔢 **عدد التغريدات التي صنفتها:** {classified_count}")
     st.markdown(f"🆔 **رمز المصنف:** `{abs(hash(user_id)) % 100000}`")
 
+    # جلب التغريدة الحالية أو تحميل جديدة
     if "current_tweet" not in st.session_state:
         st.session_state.current_tweet = fetch_random_tweet(user_id)
 
@@ -126,24 +196,25 @@ if page == "التصنيف":
 
     if tweet:
         st.markdown("### 📝 التغريدة:")
-        text =tweet["clean_text"]
-        converted = emoji.emojize(text, language='alias')
+        converted = emoji.emojize(tweet["clean_text"], language='alias')
         st.write(converted)
         st.markdown(f"🔍 **كلمة البحث:** `{tweet.get('search_term', '')}`")
 
-        is_hate_options = {"نعم": "Yes", "لا": "No"}
-        is_hate_arabic = st.radio("هل تحتوي على عنف إلكتروني؟", list(is_hate_options.keys()))
-        is_hate = is_hate_options[is_hate_arabic]
+        # اختيار التصنيف
+        is_hate_options = {"نعم": True, "لا": False}
+        is_hate_arabic = st.radio("هل تحتوي على عنف إلكتروني؟",
+                                  list(is_hate_options.keys()))
+        is_hate_flag = is_hate_options[is_hate_arabic]
 
         main_cat, sub_cat, sentiment = None, None, None
 
-        if is_hate == "Yes":
-            is_hate_flag = True
+        if is_hate_flag:
             main_categories = {
                 "التنمر الإلكتروني": "Cyberbullying",
                 "خطاب الكراهية عبر الإنترنت": "Online Hate speech",
             }
-            main_cat_arabic = st.selectbox("🧩 التصنيف الرئيسي:", list(main_categories.keys()))
+            main_cat_arabic = st.selectbox("🧩 التصنيف الرئيسي:",
+                                           list(main_categories.keys()))
             main_cat = main_categories[main_cat_arabic]
 
             if main_cat == "Online Hate speech":
@@ -157,11 +228,11 @@ if page == "التصنيف":
                     "التمييز الإقليمي": "Regional Discrimination",
                     "كراهية عامة": "General Hate"
                 }
-                sub_cat_arabic = st.selectbox("🧷 التصنيف الفرعي:", list(sub_categories.keys()))
+                sub_cat_arabic = st.selectbox("🧷 التصنيف الفرعي:",
+                                              list(sub_categories.keys()))
                 sub_cat = sub_categories[sub_cat_arabic]
         else:
-            is_hate_flag = False
-            main_cat = 'Benign'
+            main_cat = "Benign"
             sentiments = {
                 "إيجابي": "Positive",
                 "محايد": "Neutral",
@@ -170,6 +241,7 @@ if page == "التصنيف":
             sentiment_arabic = st.selectbox("🎭 الشعور:", list(sentiments.keys()))
             sentiment = sentiments[sentiment_arabic]
 
+        # زر الحفظ
         if st.button("✅ حفظ التصنيف"):
             save_annotation(
                 tweet["id"],
@@ -184,30 +256,31 @@ if page == "التصنيف":
             st.session_state.pop("current_tweet")
             st.rerun()
 
-        if st.button("❌ تعذر التصنيف"):
+        # زر غير قابلة للتصنيف
+        if st.button("❌ تعذّر التصنيف"):
             save_annotation(
                 tweet["id"],
                 tweet.get("internal_id") or tweet.get("rowid") or None,
                 user_id,
-                False,  # أو None حسب رؤيتك، لأنه ليس عنف إلكتروني
-                "Not Classifiable",  # main_category
-                None,  # sub_category
-                None  # sentiment
+                False,
+                "Not Classifiable",
+                None,
+                None
             )
-            # with get_db_connection() as conn:
-            #     with conn.cursor() as cur:
-            #         cur.execute(
-            #             "UPDATE tweet_annotations SET status = 'not_classifiable' WHERE tweet_id = %s AND user_id = %s;",
-            #             (tweet["id"], user_id)
-            #         )
-            #     conn.commit()
             st.warning("⚠️ تم تسجيل التغريدة كغير قابلة للتصنيف.")
+            st.session_state.pop("current_tweet")
+            st.rerun()
+        # زر حذف التغريدة نهائيًا
+        if st.button("🗑️ حذف التغريدة"):
+            delete_tweet(tweet["id"], user_id)
+            st.warning("🚫 تم وضع is_deleted = TRUE وتسجيل الحذف.")
             st.session_state.pop("current_tweet")
             st.rerun()
 
     else:
         st.info("🎉 لا توجد تغريدات غير مصنفة متبقية.")
 
+# =============== لوحة المتابعة ===============
 elif page == "لوحة المتابعة":
     st.title("📈 لوحة متابعة المصنفين")
 
@@ -223,49 +296,28 @@ elif page == "لوحة المتابعة":
                 st.error("🚫 كلمة المرور غير صحيحة.")
         st.stop()
 
-
-    # with get_db_connection() as conn:
-    #     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-    #         cur.execute("""
-    #             SELECT user_id, COUNT(*) AS tweets_annotated
-    #             FROM tweet_annotations
-    #             GROUP BY user_id
-    #             ORDER BY tweets_annotated DESC;
-    #         """)
-    #         stats = cur.fetchall()
-    #
-    #         cur.execute("SELECT COUNT(*) FROM twitter_hate_api_365;")
-    #         total = cur.fetchone()["count"]
-    #
-    # st.markdown(f"📦 إجمالي التغريدات: **{total}**")
-    # st.markdown("### 👥 التقدم حسب المصنفين:")
-    #
-    # for row in stats:
-    #     st.markdown(f"- 🧑 المصنف {row['user_id']}: **{row['tweets_annotated']}** تغريدة")
-
     import pandas as pd
 
-    # st.markdown("---")
     st.markdown("## 🧾 تحليل التصنيفات حسب النوع")
 
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1️⃣ إجمالي عدد التغريدات لكل main_category لكل مصنف
-            cur.execute("""
-                SELECT user_id, main_category, COUNT(*) AS count
-                FROM tweet_annotations
-                GROUP BY user_id, main_category;
-            """)
-            user_main_stats = cur.fetchall()
+    with get_db_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT user_id, main_category, COUNT(*) AS count
+            FROM tweet_annotations
+            GROUP BY user_id, main_category;
+        """)
+        user_main_stats = cur.fetchall()
 
-            # 2️⃣ التصنيفات الفرعية والشعور لكل مصنف
-            cur.execute("""
-                SELECT user_id, COALESCE(sub_category, sentiment) AS category_detail, COUNT(*) AS count
-                FROM tweet_annotations
-                GROUP BY user_id, category_detail;
-            """)
-            user_detail_stats = cur.fetchall()
+        cur.execute("""
+            SELECT user_id,
+                   COALESCE(sub_category, sentiment) AS category_detail,
+                   COUNT(*) AS count
+            FROM tweet_annotations
+            GROUP BY user_id, category_detail;
+        """)
+        user_detail_stats = cur.fetchall()
 
+    # Pivot – التصنيفات الرئيسية
     df_main = pd.DataFrame(user_main_stats)
     df_main_pivot = df_main.pivot_table(
         index="main_category",
@@ -273,11 +325,11 @@ elif page == "لوحة المتابعة":
         values="count",
         fill_value=0
     ).sort_index()
-
     df_main_pivot.loc["✅ الإجمالي"] = df_main_pivot.sum()
     st.subheader("📊 عدد التصنيفات الرئيسية لكل مصنف")
     st.dataframe(df_main_pivot, use_container_width=True)
 
+    # Pivot – التصنيفات الفرعية / المشاعر
     df_detail = pd.DataFrame(user_detail_stats)
     df_detail_pivot = df_detail.pivot_table(
         index="category_detail",
@@ -285,10 +337,6 @@ elif page == "لوحة المتابعة":
         values="count",
         fill_value=0
     ).sort_index()
-
     df_detail_pivot.loc["✅ الإجمالي"] = df_detail_pivot.sum()
     st.subheader("📊 عدد التصنيفات الفرعية / المشاعر لكل مصنف")
     st.dataframe(df_detail_pivot, use_container_width=True)
-
-
-
